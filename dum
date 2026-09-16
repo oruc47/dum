@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""dum — daily update mail.
+
+    dum        create today's update note and open it in Obsidian
+    dum -d     turn today's note into an Outlook draft you can double-click
+
+Both commands work inside one folder per day,
+"7 - updates/daily_updates/daily_update_<date>/", holding the markdown note you
+write and the .emltpl draft built from it. An existing note is never rewritten.
+"""
+
+import re
+import subprocess
+import sys
+import urllib.parse
+from datetime import date
+from email import policy
+from email.message import EmailMessage
+from email.utils import formatdate
+from pathlib import Path
+
+# ============ EDIT THESE ============
+VAULT = Path("/Users/oruc/Desktop/bfi2b")
+VAULT_NAME = "bfi2b"                                  # the name Obsidian shows
+UPDATES = VAULT / "7 - updates" / "daily_updates"
+TO = "Ali Hortacsu <hortacsu@gmail.com>, Ali Hortacsu <hortacsu@uchicago.edu>"
+CC = ""
+# ====================================
+
+# the Outlook body style, copied from the template Ikbal has been sending
+STYLE = ("direction: ltr; font-family: Verdana, Arial, Helvetica, sans-serif; "
+         "font-size: 11pt; color: rgb(0, 0, 0);")
+
+
+def subject_for(day):
+    """The subject line, e.g. "[Update] Wednesday, September 16"."""
+    return "[Update] {}, {} {}".format(
+        day.strftime("%A"), day.strftime("%B"), day.day)
+
+
+def note_path(day):
+    folder = UPDATES / "daily_update_{}".format(day.isoformat())
+    return folder / "daily_update_{}.md".format(day.isoformat())
+
+
+def blank_note(day):
+    """The markdown a new day starts from."""
+    return """---
+to: {to}
+cc: {cc}
+subject: "{subject}"
+date: {day}
+---
+
+Merhaba Hocam,
+
+**What I did Today:**
+
+-
+
+**What I will do tomorrow:**
+
+-
+
+**Questions for Ali Hoca (y/n)?**
+
+n
+
+—
+Ikbal
+""".format(to=TO, cc=CC, subject=subject_for(day), day=day.isoformat())
+
+
+# ---------- reading the note back ----------
+
+def split_note(text):
+    """Return the frontmatter as a dict and the body as a list of lines."""
+    lines = text.splitlines()
+    if lines[0].strip() != "---":
+        sys.exit("the note has no frontmatter; the first line must be ---")
+
+    end = lines.index("---", 1)
+    fields = {}
+    for line in lines[1:end]:
+        if ":" in line:
+            name, value = line.split(":", 1)
+            fields[name.strip().lower()] = value.strip().strip('"')
+
+    body = lines[end + 1:]
+    while body and not body[0].strip():
+        body.pop(0)
+    return fields, body
+
+
+# ---------- markdown, as much of it as an email needs ----------
+
+def inline_html(text):
+    """Bold, italic, code and links, with the HTML specials escaped first."""
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = re.sub(r"\[(.+?)\]\((.+?)\)", r'<a href="\2">\1</a>', text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"`(.+?)`", r'<span style="font-family: monospace;">\1</span>', text)
+    return text
+
+
+def inline_plain(text):
+    """The same line with the markers taken out, for the plain text part."""
+    text = re.sub(r"\[(.+?)\]\((.+?)\)", r"\1 (\2)", text)
+    text = text.replace("**", "").replace("`", "")
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", text)
+    return text
+
+
+def is_bullet(line):
+    return line.lstrip().startswith(("- ", "* ")) or line.strip() in ("-", "*")
+
+
+def bullet_text(line):
+    return line.lstrip()[1:].strip()
+
+
+def body_to_html(body):
+    """Wrap the body in the divs and lists Outlook expects."""
+    parts = ["<html>", "<head>",
+             '<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">',
+             "</head>", "<body>"]
+    in_list = False
+
+    for line in body:
+        if is_bullet(line):
+            if not bullet_text(line):     # an unfilled "-" from the template
+                continue
+            if not in_list:
+                parts.append('<ul style="{}">'.format(STYLE))
+                in_list = True
+            parts.append("<li>{}</li>".format(inline_html(bullet_text(line))))
+            continue
+
+        if in_list:
+            parts.append("</ul>")
+            in_list = False
+
+        if not line.strip():
+            parts.append('<div style="{}"><br></div>'.format(STYLE))
+        else:
+            parts.append('<div style="{}">{}</div>'.format(STYLE, inline_html(line)))
+
+    if in_list:
+        parts.append("</ul>")
+    parts += ["</body>", "</html>"]
+    return "\n".join(parts)
+
+
+def body_to_plain(body):
+    lines = []
+    for line in body:
+        if is_bullet(line):
+            if bullet_text(line):
+                lines.append("- " + inline_plain(bullet_text(line)))
+        else:
+            lines.append(inline_plain(line))
+    return "\n".join(lines) + "\n"
+
+
+# ---------- the draft ----------
+
+def build_draft(fields, body):
+    mail = EmailMessage(policy=policy.SMTP)
+    mail["To"] = fields.get("to") or TO
+    if fields.get("cc"):
+        mail["Cc"] = fields["cc"]
+    mail["Subject"] = fields["subject"]
+    mail["Date"] = formatdate(localtime=True)
+    mail["X-Unsent"] = "1"          # Outlook opens it as a draft, not as mail received
+    mail.set_content(body_to_plain(body), subtype="plain", charset="utf-8",
+                     cte="quoted-printable")
+    mail.add_alternative(body_to_html(body), subtype="html", charset="utf-8",
+                         cte="quoted-printable")
+    return mail
+
+
+# ---------- the two commands ----------
+
+def open_in_obsidian(path):
+    inside_vault = path.relative_to(VAULT)
+    uri = "obsidian://open?vault={}&file={}".format(
+        urllib.parse.quote(VAULT_NAME), urllib.parse.quote(str(inside_vault)))
+    subprocess.run(["open", uri], check=True)
+
+
+def start_today(day):
+    note = note_path(day)
+    if note.exists():
+        print("today's note is already there:", note)
+    else:
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(blank_note(day), encoding="utf-8")
+        print("wrote", note)
+        print("subject:", subject_for(day))
+    open_in_obsidian(note)
+
+
+def finish_today(day):
+    note = note_path(day)
+    if not note.exists():
+        sys.exit("no note for {} yet — run dum first".format(day.isoformat()))
+
+    fields, body = split_note(note.read_text(encoding="utf-8"))
+    draft = build_draft(fields, body)
+    out = note.parent / "{}.emltpl".format(fields["subject"])
+    out.write_bytes(bytes(draft))
+
+    print("wrote", out)
+    print("to:", draft["To"])
+    print("subject:", draft["Subject"])
+    print("double-click it to open the draft in Outlook, then read it and send.")
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if not args:
+        start_today(date.today())
+    elif args[0] in ("-d", "--done"):
+        finish_today(date.today())
+    else:
+        sys.exit(__doc__)
