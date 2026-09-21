@@ -2,13 +2,14 @@
 """dum — daily update mail.
 
     dum        create today's update note and open it in Obsidian
-    dum -d     turn today's note into an Outlook draft you can double-click
+    dum -d     turn today's note into an Outlook draft and open it
 
 Both commands work inside one folder per day,
 "7 - updates/daily_updates/daily_update_<date>/", holding the markdown note you
 write and the .emltpl draft built from it. An existing note is never rewritten.
 """
 
+import mimetypes
 import re
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import urllib.parse
 from datetime import date
 from email import policy
 from email.message import EmailMessage
-from email.utils import formatdate
+from email.utils import formatdate, make_msgid
 from pathlib import Path
 
 # ============ EDIT THESE ============
@@ -30,6 +31,10 @@ CC = ""
 # the Outlook body style, copied from the template Ikbal has been sending
 STYLE = ("direction: ltr; font-family: Verdana, Arial, Helvetica, sans-serif; "
          "font-size: 11pt; color: rgb(0, 0, 0);")
+
+# Outlook's own marker for each nesting level, and the gap after a top-level item
+MARKERS = ["disc", "circle", "square"]
+TOP_ITEM_GAP = "0.6em"
 
 
 def subject_for(day):
@@ -92,7 +97,76 @@ def split_note(text):
     return fields, body
 
 
-# ---------- markdown, as much of it as an email needs ----------
+# ---------- bullets ----------
+
+def is_bullet(line):
+    return line.lstrip().startswith(("- ", "* ")) or line.strip() in ("-", "*")
+
+
+def bullet_text(line):
+    return line.lstrip()[1:].strip()
+
+
+def indent_width(line):
+    """How far a line is indented, counting a tab as four spaces."""
+    text = line.replace("\t", "    ")
+    return len(text) - len(text.lstrip())
+
+
+def bullet_levels(body):
+    """The nesting level of each line, or -1 where the line is not a bullet.
+
+    The levels come from the order of the indents rather than their size, so
+    tabs, two spaces and four spaces all nest the same way.
+    """
+    levels = []
+    open_indents = []
+    for line in body:
+        if not is_bullet(line):
+            levels.append(-1)
+            if line.strip():            # blank lines inside a list are spacing
+                open_indents = []
+            continue
+
+        width = indent_width(line)
+        while open_indents and width < open_indents[-1]:
+            open_indents.pop()
+        if not open_indents or width > open_indents[-1]:
+            open_indents.append(width)
+        levels.append(len(open_indents) - 1)
+    return levels
+
+
+# ---------- images ----------
+
+IMAGE_LINE = re.compile(r"^\s*!\[\[(?P<wiki>[^\]]+)\]\]\s*$"
+                        r"|^\s*!\[[^\]]*\]\((?P<path>[^)]+)\)\s*$")
+
+
+def image_in_line(line):
+    """The file an image line points at, or None if the line is not one."""
+    found = IMAGE_LINE.match(line)
+    if found is None:
+        return None
+    return found.group("wiki") or found.group("path")
+
+
+def find_image(name, note_folder):
+    """Where an embedded image actually lives."""
+    name = name.split("|")[0].strip()          # Obsidian allows ![[file.png|300]]
+    direct = Path(name)
+    if direct.is_absolute() and direct.exists():
+        return direct
+    beside = note_folder / name
+    if beside.exists():
+        return beside
+    matches = sorted(VAULT.rglob(Path(name).name))
+    if matches:
+        return matches[0]
+    return None
+
+
+# ---------- markdown to the two bodies ----------
 
 def inline_html(text):
     """Bold, italic, code and links, with the HTML specials escaped first."""
@@ -112,52 +186,96 @@ def inline_plain(text):
     return text
 
 
-def is_bullet(line):
-    return line.lstrip().startswith(("- ", "* ")) or line.strip() in ("-", "*")
+def list_open(level):
+    marker = MARKERS[level % len(MARKERS)]
+    if level == 0:
+        return '<ul style="{} list-style-type: {};">'.format(STYLE, marker)
+    return '<ul style="list-style-type: {};">'.format(marker)
 
 
-def bullet_text(line):
-    return line.lstrip()[1:].strip()
+def item_open(level):
+    if level == 0:
+        return '<li style="margin-bottom: {};">'.format(TOP_ITEM_GAP)
+    return "<li>"
 
 
-def body_to_html(body):
-    """Wrap the body in the divs and lists Outlook expects."""
+def body_to_html(body, images):
+    """The body as the nested lists and divs Outlook renders.
+
+    A nested list is opened inside the item above it, which is what makes
+    Outlook show the levels the way Obsidian does, with its own disc, circle
+    and square markers.
+    """
+    levels = bullet_levels(body)
     parts = ["<html>", "<head>",
              '<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">',
              "</head>", "<body>"]
-    in_list = False
+    depth = 0                       # how many lists are open
 
-    for line in body:
-        if is_bullet(line):
-            if not bullet_text(line):     # an unfilled "-" from the template
+    for line, level in zip(body, levels):
+        if level >= 0:
+            if not bullet_text(line):        # an unfilled "-" from the template
                 continue
-            if not in_list:
-                parts.append('<ul style="{}">'.format(STYLE))
-                in_list = True
-            parts.append("<li>{}</li>".format(inline_html(bullet_text(line))))
+            while depth > level + 1:
+                parts += ["</li>", "</ul>"]
+                depth -= 1
+            if depth == level + 1:
+                parts.append("</li>")
+            while depth < level + 1:
+                parts.append(list_open(depth))
+                depth += 1
+            parts.append(item_open(level) + inline_html(bullet_text(line)))
             continue
 
-        if in_list:
-            parts.append("</ul>")
-            in_list = False
+        if depth and not line.strip():       # spacing inside a list
+            continue
+        while depth:
+            parts += ["</li>", "</ul>"]
+            depth -= 1
 
-        if not line.strip():
+        image = image_in_line(line)
+        if image is not None:
+            parts.append(image_html(image, images))
+        elif not line.strip():
             parts.append('<div style="{}"><br></div>'.format(STYLE))
         else:
             parts.append('<div style="{}">{}</div>'.format(STYLE, inline_html(line)))
 
-    if in_list:
-        parts.append("</ul>")
+    while depth:
+        parts += ["</li>", "</ul>"]
+        depth -= 1
     parts += ["</body>", "</html>"]
     return "\n".join(parts)
 
 
+def image_html(name, images):
+    """The <img> for an embedded image, remembering it so it can be attached."""
+    if name.startswith(("http://", "https://")):
+        return '<div style="{}"><img src="{}" style="max-width: 100%;"></div>'.format(
+            STYLE, name)
+
+    found = find_image(name, images["folder"])
+    if found is None:
+        print("could not find the image", name, "- it was left out of the email")
+        return '<div style="{}">[missing image: {}]</div>'.format(STYLE, name)
+
+    cid = make_msgid()
+    images["files"].append((cid, found))
+    return ('<div style="{}"><img src="cid:{}" style="max-width: 100%;"></div>'
+            .format(STYLE, cid[1:-1]))
+
+
 def body_to_plain(body):
+    levels = bullet_levels(body)
     lines = []
-    for line in body:
-        if is_bullet(line):
+    for line, level in zip(body, levels):
+        if level >= 0:
             if bullet_text(line):
-                lines.append("- " + inline_plain(bullet_text(line)))
+                lines.append("  " * level + "- " + inline_plain(bullet_text(line)))
+            continue
+        image = image_in_line(line)
+        if image is not None:
+            lines.append("[image: {}]".format(Path(image.split("|")[0]).name))
         else:
             lines.append(inline_plain(line))
     return "\n".join(lines) + "\n"
@@ -165,7 +283,10 @@ def body_to_plain(body):
 
 # ---------- the draft ----------
 
-def build_draft(fields, body):
+def build_draft(fields, body, note_folder):
+    images = {"folder": note_folder, "files": []}
+    html = body_to_html(body, images)
+
     mail = EmailMessage(policy=policy.SMTP)
     mail["To"] = fields.get("to") or TO
     if fields.get("cc"):
@@ -175,9 +296,16 @@ def build_draft(fields, body):
     mail["X-Unsent"] = "1"          # Outlook opens it as a draft, not as mail received
     mail.set_content(body_to_plain(body), subtype="plain", charset="utf-8",
                      cte="quoted-printable")
-    mail.add_alternative(body_to_html(body), subtype="html", charset="utf-8",
+    mail.add_alternative(html, subtype="html", charset="utf-8",
                          cte="quoted-printable")
-    return mail
+
+    html_part = mail.get_payload()[1]
+    for cid, path in images["files"]:
+        kind, _ = mimetypes.guess_type(path.name)
+        maintype, subtype = kind.split("/") if kind else ("application", "octet-stream")
+        html_part.add_related(path.read_bytes(), maintype=maintype, subtype=subtype,
+                              cid=cid, filename=path.name)
+    return mail, [path for _, path in images["files"]]
 
 
 # ---------- the two commands ----------
@@ -207,14 +335,17 @@ def finish_today(day):
         sys.exit("no note for {} yet — run dum first".format(day.isoformat()))
 
     fields, body = split_note(note.read_text(encoding="utf-8"))
-    draft = build_draft(fields, body)
+    draft, attached = build_draft(fields, body, note.parent)
     out = note.parent / "{}.emltpl".format(fields["subject"])
     out.write_bytes(bytes(draft))
 
     print("wrote", out)
     print("to:", draft["To"])
     print("subject:", draft["Subject"])
-    print("double-click it to open the draft in Outlook, then read it and send.")
+    for path in attached:
+        print("embedded:", path.name)
+    print("opening it in Outlook — read it there and send.")
+    subprocess.run(["open", str(out)], check=True)
 
 
 if __name__ == "__main__":
